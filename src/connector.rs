@@ -258,8 +258,7 @@ impl ConnectorTrait for Connector {
         }
     }
 
-    //TODO other order types
-
+    //TODO other order types where different stops are needed
     async fn submit_order(
         &self,
         ticker: &str,
@@ -275,226 +274,145 @@ impl ConnectorTrait for Connector {
         let contract = ibapi::contracts::Contract::stock(ticker).build();
         let ib = self.ib.as_ref().unwrap().contract_details(&contract).await;
 
-        if order_type == OrderType::Market {
-            let mut order = Order::default();
-            order.action = match action.as_str() {
-                "BUY" => Action::Buy,
-                "SELL" => Action::Sell,
-                _ => Action::Buy,
-            };
+        match OrderType::Market {
+            OrderType::Market => {
+                let mut order = Order::default();
+                order.action = match action.as_str() {
+                    "BUY" => Action::Buy,
+                    "SELL" => Action::Sell,
+                    _ => Action::Buy,
+                };
 
-            let order_id = self.ib.as_ref().unwrap().next_order_id();
+                let order_id = self.ib.as_ref().unwrap().next_order_id();
 
-            let mut trade = self
-                .ib
-                .as_ref()
-                .unwrap()
-                .place_order(order_id, &contract, &order)
-                .await
-                .unwrap();
+                let mut trade = self
+                    .ib
+                    .as_ref()
+                    .unwrap()
+                    .place_order(order_id, &contract, &order)
+                    .await
+                    .unwrap();
 
-            while let Some(status) = trade.next().await {
-                match status {
-                    Ok(placeorder) => match placeorder {
-                        PlaceOrder::OrderStatus(order_status) => {
-                            if order_status.status != "Filled" {
-                                return (false, "Market order was not filled.".to_string());
-                            }
-                            let avg_fill_price = order_status.average_fill_price;
-                            let price_diff = if action == "BUY" {
-                                avg_fill_price - stop_price
-                            } else {
-                                stop_price - avg_fill_price
-                            };
-
-                            let stop_prices = vec![
-                                if action == "BUY" {
-                                    (stop_price + price_diff * 2.0 / 3.0 * 100.0).round() / 100.0
+                while let Some(status) = trade.next().await {
+                    match status {
+                        Ok(placeorder) => match placeorder {
+                            PlaceOrder::OrderStatus(order_status) => {
+                                if order_status.status != "Filled" {
+                                    return (false, "Market order was not filled.".to_string());
+                                }
+                                let avg_fill_price = order_status.average_fill_price;
+                                let price_diff = if action == "BUY" {
+                                    avg_fill_price - stop_price
                                 } else {
-                                    (stop_price - price_diff * 2.0 / 3.0 * 100.0).round() / 100.0
-                                },
-                                if action == "BUY" {
-                                    (stop_price + price_diff * 1.0 / 3.0 * 100.0).round() / 100.0
-                                } else {
-                                    (stop_price - price_diff * 1.0 / 3.0 * 100.0).round() / 100.0
-                                },
-                                (stop_price * 100.0).round() / 100.0,
-                            ];
-
-                            let stop_sizes = vec![qty / 3, qty / 3, qty - 2 * (qty / 3)];
-
-                            for (sp, sq) in stop_prices.iter().zip(stop_sizes.iter()) {
-                                order.action = if action == "BUY" {
-                                    Action::Buy
-                                } else {
-                                    Action::Sell
+                                    stop_price - avg_fill_price
                                 };
-                                order.order_type = "STOP".to_string();
-                                order.total_quantity = *sq as f64;
-                                order.aux_price = Some(*sp);
 
-                                let stop_order_id = self.ib.as_ref().unwrap().next_order_id();
-                                let _ = self
-                                    .ib
-                                    .as_ref()
-                                    .unwrap()
-                                    .place_order(stop_order_id, &contract, &order)
-                                    .await;
+                                let stop_prices = vec![
+                                    if action == "BUY" {
+                                        (stop_price + price_diff * 2.0 / 3.0 * 100.0).round()
+                                            / 100.0
+                                    } else {
+                                        (stop_price - price_diff * 2.0 / 3.0 * 100.0).round()
+                                            / 100.0
+                                    },
+                                    if action == "BUY" {
+                                        (stop_price + price_diff * 1.0 / 3.0 * 100.0).round()
+                                            / 100.0
+                                    } else {
+                                        (stop_price - price_diff * 1.0 / 3.0 * 100.0).round()
+                                            / 100.0
+                                    },
+                                    (stop_price * 100.0).round() / 100.0,
+                                ];
+
+                                let stop_sizes = vec![qty / 3, qty / 3, qty - 2 * (qty / 3)];
+
+                                for (sp, sq) in stop_prices.iter().zip(stop_sizes.iter()) {
+                                    order.action = if action == "BUY" {
+                                        Action::Buy
+                                    } else {
+                                        Action::Sell
+                                    };
+                                    order.order_type = "STOP".to_string();
+                                    order.total_quantity = *sq as f64;
+                                    order.aux_price = Some(*sp);
+
+                                    let stop_order_id = self.ib.as_ref().unwrap().next_order_id();
+                                    let _ = self
+                                        .ib
+                                        .as_ref()
+                                        .unwrap()
+                                        .place_order(stop_order_id, &contract, &order)
+                                        .await;
+                                }
                             }
+                            _ => {}
+                        },
+                        Err(e) => {
+                            return (false, format!("Error placing order: {:?}", e));
                         }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        return (false, format!("Error placing order: {:?}", e));
                     }
                 }
             }
-        }
-
-        //
-        //            if order_type == 'Market + 3 Stops':
-        //                market_order = MarketOrder(action, qty)
-        //                trade = self.ib.placeOrder(contract, market_order)
-        //                while trade.isActive():
-        //                    self.ib.sleep(1)
-        //
-        //                if trade.orderStatus.status != 'Filled':
-        //                    return False, "Market order was not filled."
-        //
-        //                avg_fill_price = trade.orderStatus.avgFillPrice
-        //                price_diff = avg_fill_price - stop_price if action == 'BUY' else stop_price - avg_fill_price
-        //
-        //                stop_prices = [
-        //                    round(stop_price + price_diff * 2 / 3, 2) if action == 'BUY' else round(stop_price - price_diff * 2 / 3, 2),
-        //                    round(stop_price + price_diff * 1 / 3, 2) if action == 'BUY' else round(stop_price - price_diff * 1 / 3, 2),
-        //                    round(stop_price, 2)
-        //                ]
-        //                stop_sizes = [qty // 3, qty // 3, qty - 2 * (qty // 3)]
-        //
-        //                for sp, sq in zip(stop_prices, stop_sizes):
-        //                    stop_order = StopOrder('SELL' if action == 'BUY' else 'BUY', sq, sp, tif='GTC')
-        //                    self.ib.placeOrder(contract, stop_order)
-        //                    self.ib.sleep(0.5)
-        //
-        //                return True, f"{action} {qty} shares of {ticker} at ${avg_fill_price:.2f}. 3 stop-loss orders submitted."
-        //
-        //            elif order_type == '3 Stops Only':
-        //                price_diff = entry_price - stop_price if action == 'BUY' else stop_price - entry_price
-        //                stop_prices = [
-        //                    round(stop_price + price_diff * 2 / 3, 2) if action == 'BUY' else round(stop_price - price_diff * 2 / 3, 2),
-        //                    round(stop_price + price_diff * 1 / 3, 2) if action == 'BUY' else round(stop_price - price_diff * 1 / 3, 2),
-        //                    round(stop_price, 2)
-        //                ]
-        //                stop_sizes = [qty // 3, qty // 3, qty - 2 * (qty // 3)]
-        //
-        //                for sp, sq in zip(stop_prices, stop_sizes):
-        //                    stop_order = StopOrder('SELL' if action == 'BUY' else 'BUY', sq, sp, tif='GTC')
-        //                    self.ib.placeOrder(contract, stop_order)
-        //                    self.ib.sleep(0.5)
-        //
-        //                return True, f"3 stop-loss orders for {qty} shares of {ticker} submitted."
-        //
-        //            elif order_type == 'Limit Order':
-        //                order = LimitOrder(action, qty, entry_price)
-        //                self.ib.placeOrder(contract, order)
-        //                return True, f"Limit order to {action} {qty} shares of {ticker} at ${entry_price:.2f} submitted."
-        //
-        //            elif order_type == 'Stop Order':
-        //                order = StopOrder(action, qty, stop_price)
-        //                self.ib.placeOrder(contract, order)
-        //                return True, f"Stop order to {action} {qty} shares of {ticker} at stop ${stop_price:.2f} submitted."
-        //
-        //            elif order_type == 'Market + 1 Stop':
-        //                market_order = MarketOrder(action, qty)
-        //                trade = self.ib.placeOrder(contract, market_order)
-        //                while trade.isActive():
-        //                    self.ib.sleep(1)
-        //
-        //                if trade.orderStatus.status != 'Filled':
-        //                    return False, "Market order was not filled."
-        //
-        //                avg_fill_price = trade.orderStatus.avgFillPrice
-        //                stop_order = StopOrder('SELL' if action == 'BUY' else 'BUY', qty, stop_price, tif='GTC')
-        //                self.ib.placeOrder(contract, stop_order)
-        //
-        //                return True, f"{action} {qty} shares of {ticker} at ${avg_fill_price:.2f}. 1 stop-loss order submitted at ${stop_price:.2f}."
-        //
-        //            elif order_type == 'Market + 3 Stops + OCO':
-        //                # Place market order
-        //                market_order = MarketOrder(action, qty)
-        //                trade = self.ib.placeOrder(contract, market_order)
-        //                while trade.isActive():
-        //                    self.ib.sleep(1)
-        //
-        //                if trade.orderStatus.status != 'Filled':
-        //                    return False, "Market order was not filled."
-        //
-        //                avg_fill_price = trade.orderStatus.avgFillPrice
-        //                price_diff = avg_fill_price - stop_price if action == 'BUY' else stop_price - avg_fill_price
-        //
-        //                # Calculate the 3 stop prices
-        //                stop_prices = [
-        //                    round(stop_price + price_diff * 2 / 3, 2) if action == 'BUY' else round(stop_price - price_diff * 2 / 3, 2),
-        //                    round(stop_price + price_diff * 1 / 3, 2) if action == 'BUY' else round(stop_price - price_diff * 1 / 3, 2),
-        //                    round(stop_price, 2)
-        //                ]
-        //                # Calculate sizes: 1/3 for OCO, remaining 2/3 divided between the other stops
-        //                oco_qty = qty // 3
-        //                remaining_qty = qty - oco_qty
-        //                stop_sizes = [remaining_qty // 2, remaining_qty - remaining_qty // 2]
-        //
-        //                # Calculate 2R price (target price for limit sell)
-        //                if action == 'BUY':
-        //                    target_price = round(avg_fill_price + 2 * price_diff, 2)
-        //                    oco_stop_price = stop_prices[0]  # Highest stop (closest to entry)
-        //                else:
-        //                    target_price = round(avg_fill_price - 2 * price_diff, 2)
-        //                    oco_stop_price = stop_prices[0]  # Highest stop
-        //
-        //                # Create OCO group ID (unique identifier for the OCO pair)
-        //                oca_group = f"OCO_{int(time.time() * 1000)}"
-        //
-        //                # Create limit sell order (target at 2R)
-        //                limit_order = LimitOrder('SELL' if action == 'BUY' else 'BUY', oco_qty, target_price, tif='GTC')
-        //                limit_order.ocaGroup = oca_group
-        //                limit_order.ocaType = 1  # One-Cancels-Other
-        //
-        //                # Create stop order (highest stop)
-        //                oco_stop_order = StopOrder('SELL' if action == 'BUY' else 'BUY', oco_qty, oco_stop_price, tif='GTC')
-        //                oco_stop_order.ocaGroup = oca_group
-        //                oco_stop_order.ocaType = 1  # One-Cancels-Other
-        //
-        //                # Place OCO orders
-        //                self.ib.placeOrder(contract, limit_order)
-        //                self.ib.sleep(0.2)
-        //                self.ib.placeOrder(contract, oco_stop_order)
-        //                self.ib.sleep(0.5)
-        //
-        //                # Place the remaining 2 stop orders for the rest of the position
-        //                for i in range(1, 3):  # Only the second and third stops
-        //                    stop_order = StopOrder('SELL' if action == 'BUY' else 'BUY', stop_sizes[i-1], stop_prices[i], tif='GTC')
-        //                    self.ib.placeOrder(contract, stop_order)
-        //                    self.ib.sleep(0.5)
-        //
-        //                return True, f"{action} {qty} shares of {ticker} at ${avg_fill_price:.2f}. OCO (Limit@${target_price:.2f}/Stop@${oco_stop_price:.2f}) + 2 stops submitted."
-        //
-        //            elif order_type == 'Market Order':
-        //                market_order = MarketOrder(action, qty)
-        //                trade = self.ib.placeOrder(contract, market_order)
-        //                while trade.isActive():
-        //                    self.ib.sleep(1)
-        //
-        //                if trade.orderStatus.status != 'Filled':
-        //                    return False, "Market order was not filled."
-        //
-        //                avg_fill_price = trade.orderStatus.avgFillPrice
-        //                return True, f"{action} {qty} shares of {ticker} at market price ${avg_fill_price:.2f} submitted."
-        //
-        //            else:
-        //                return False, "Unknown order type selected."
-        //
-        //        except Exception as e:
-        //            return False, str(e)
+            OrderType::Limit => {
+                let mut order = Order::default();
+                order.action = match action.as_str() {
+                    "BUY" => Action::Buy,
+                    "SELL" => Action::Sell,
+                    _ => Action::Buy,
+                };
+                order.total_quantity = qty as f64;
+                order.limit_price = Some(entry_price);
+                order.order_type = "LMT".to_string();
+                let order_id = self.ib.as_ref().unwrap().next_order_id();
+                let _trade = self
+                    .ib
+                    .as_ref()
+                    .unwrap()
+                    .place_order(order_id, &contract, &order)
+                    .await
+                    .unwrap();
+                return (
+                    true,
+                    format!(
+                        "Limit order to {} {} shares of {} at ${:.2} submitted.",
+                        action, qty, ticker, entry_price
+                    ),
+                );
+            }
+            OrderType::Stop => {
+                let mut order = Order::default();
+                order.action = match action.as_str() {
+                    "BUY" => Action::Buy,
+                    "SELL" => Action::Sell,
+                    _ => Action::Buy,
+                };
+                order.order_type = "STOP".to_string();
+                order.total_quantity = qty as f64;
+                order.aux_price = Some(stop_price);
+                let order_id = self.ib.as_ref().unwrap().next_order_id();
+                let _trade = self
+                    .ib
+                    .as_ref()
+                    .unwrap()
+                    .place_order(order_id, &contract, &order)
+                    .await
+                    .unwrap();
+                return (
+                    true,
+                    format!(
+                        "Stop order to {} {} shares of {} at stop ${:.2} submitted.",
+                        action, qty, ticker, stop_price
+                    ),
+                );
+            }
+            _ => {
+                return (
+                    false,
+                    "Order submission logic not yet implemented.".to_string(),
+                );
+            }
+        };
 
         (
             true,
