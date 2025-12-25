@@ -1,18 +1,24 @@
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
 
 use ibapi::{
     Client,
     accounts::types::AccountId,
     market_data::historical::{Duration, WhatToShow},
-    orders::{Action, Order, OrderStatus, PlaceOrder, builder::OrderType},
+    orders::{Action, Order, PlaceOrder, builder::OrderType},
     prelude::{AccountUpdate, HistoricalBarSize, TradingHours},
 };
 use time::macros::datetime;
 
-struct Connector {
+#[allow(async_fn_in_trait)]
+pub(crate) struct Connector {
     ib: Option<Client>,
 }
 
+lazy_static::lazy_static! {
+    pub(crate) static ref CONNECTOR: tokio::sync::RwLock<Connector> = tokio::sync::RwLock::new(Connector::new());
+}
+
+#[allow(async_fn_in_trait)]
 pub trait ConnectorTrait {
     fn new() -> Self;
     async fn connect(&self, address: &str, port: u16, client_id: i32) -> bool;
@@ -29,7 +35,6 @@ pub trait ConnectorTrait {
         stop_price: f64,
         entry_price: f64,
         action: String,
-        order_type: OrderType,
     ) -> (bool, String);
 }
 
@@ -39,10 +44,7 @@ impl ConnectorTrait for Connector {
     }
 
     async fn connect(&self, address: &str, port: u16, client_id: i32) -> bool {
-        match Client::connect(format!("{}:{}", address, port).as_str(), client_id).await {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        (Client::connect(format!("{}:{}", address, port).as_str(), client_id).await).is_ok()
     }
 
     fn is_connected(&self) -> bool {
@@ -53,7 +55,7 @@ impl ConnectorTrait for Connector {
     }
 
     fn disconnect(&mut self) {
-        if let Some(client) = &self.ib {
+        if self.ib.is_some() {
             self.ib = None;
         }
     }
@@ -68,7 +70,7 @@ impl ConnectorTrait for Connector {
                 .ib
                 .as_ref()
                 .unwrap()
-                .account_updates(&AccountId { 0: "".into() })
+                .account_updates(&AccountId("".into()))
                 .await
                 .unwrap();
         }
@@ -166,22 +168,23 @@ impl ConnectorTrait for Connector {
         let mut current_price = None;
 
         for _ in 0..10 {
-            if let Some(subbed) = subbed_hash.get_mut(ticker) {
-                if let Some(price) = subbed.as_mut().unwrap().next().await {
-                    match price.unwrap() {
-                        ibapi::market_data::realtime::TickTypes::Price(p) => {
-                            if p.price > 0.0 {
-                                current_price = Some(p.price);
-                                println!("Current price for {}: {:?}", ticker, current_price);
-                                break;
-                            }
+            if let Some(subbed) = subbed_hash.get_mut(ticker)
+                && let Some(price) = subbed.as_mut().unwrap().next().await
+            {
+                match price.unwrap() {
+                    ibapi::market_data::realtime::TickTypes::Price(p) => {
+                        if p.price > 0.0 {
+                            current_price = Some(p.price);
+                            println!("Current price for {}: {:?}", ticker, current_price);
+                            break;
                         }
-                        _ => {
-                            println!("Other tick data received");
-                        }
+                    }
+                    _ => {
+                        println!("Other tick data received");
                     }
                 }
             }
+
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
@@ -190,7 +193,7 @@ impl ConnectorTrait for Connector {
                 if let Some(subbed) = subbed_hash.get_mut(ticker) {
                     subbed.as_mut().unwrap().cancel().await;
                 }
-                return current_price;
+                current_price
             }
             None => {
                 if let Some(subbed) = subbed_hash.get_mut(ticker) {
@@ -266,21 +269,23 @@ impl ConnectorTrait for Connector {
         stop_price: f64,
         entry_price: f64,
         action: String,
-        order_type: OrderType,
     ) -> (bool, String) {
-        if self.is_connected() == false {
+        if !self.is_connected() {
             return (false, "Not connected to IB Gateway".to_string());
         }
         let contract = ibapi::contracts::Contract::stock(ticker).build();
-        let ib = self.ib.as_ref().unwrap().contract_details(&contract).await;
 
         match OrderType::Market {
             OrderType::Market => {
-                let mut order = Order::default();
-                order.action = match action.as_str() {
-                    "BUY" => Action::Buy,
-                    "SELL" => Action::Sell,
-                    _ => Action::Buy,
+                let mut order = Order {
+                    action: match action.as_str() {
+                        "BUY" => Action::Buy,
+                        "SELL" => Action::Sell,
+                        _ => Action::Buy,
+                    },
+                    order_type: "".to_string(),
+                    total_quantity: qty as f64,
+                    ..Default::default()
                 };
 
                 let order_id = self.ib.as_ref().unwrap().next_order_id();
@@ -295,8 +300,8 @@ impl ConnectorTrait for Connector {
 
                 while let Some(status) = trade.next().await {
                     match status {
-                        Ok(placeorder) => match placeorder {
-                            PlaceOrder::OrderStatus(order_status) => {
+                        Ok(placeorder) => {
+                            if let PlaceOrder::OrderStatus(order_status) = placeorder {
                                 if order_status.status != "Filled" {
                                     return (false, "Market order was not filled.".to_string());
                                 }
@@ -307,7 +312,7 @@ impl ConnectorTrait for Connector {
                                     stop_price - avg_fill_price
                                 };
 
-                                let stop_prices = vec![
+                                let stop_prices = [
                                     if action == "BUY" {
                                         (stop_price + price_diff * 2.0 / 3.0 * 100.0).round()
                                             / 100.0
@@ -325,7 +330,7 @@ impl ConnectorTrait for Connector {
                                     (stop_price * 100.0).round() / 100.0,
                                 ];
 
-                                let stop_sizes = vec![qty / 3, qty / 3, qty - 2 * (qty / 3)];
+                                let stop_sizes = [qty / 3, qty / 3, qty - 2 * (qty / 3)];
 
                                 for (sp, sq) in stop_prices.iter().zip(stop_sizes.iter()) {
                                     order.action = if action == "BUY" {
@@ -346,8 +351,7 @@ impl ConnectorTrait for Connector {
                                         .await;
                                 }
                             }
-                            _ => {}
-                        },
+                        }
                         Err(e) => {
                             return (false, format!("Error placing order: {:?}", e));
                         }
@@ -355,15 +359,17 @@ impl ConnectorTrait for Connector {
                 }
             }
             OrderType::Limit => {
-                let mut order = Order::default();
-                order.action = match action.as_str() {
-                    "BUY" => Action::Buy,
-                    "SELL" => Action::Sell,
-                    _ => Action::Buy,
+                let order = Order {
+                    action: match action.as_str() {
+                        "BUY" => Action::Buy,
+                        "SELL" => Action::Sell,
+                        _ => Action::Buy,
+                    },
+                    order_type: "STOP".to_string(),
+                    total_quantity: qty as f64,
+                    aux_price: Some(stop_price),
+                    ..Default::default()
                 };
-                order.total_quantity = qty as f64;
-                order.limit_price = Some(entry_price);
-                order.order_type = "LMT".to_string();
                 let order_id = self.ib.as_ref().unwrap().next_order_id();
                 let _trade = self
                     .ib
@@ -381,15 +387,18 @@ impl ConnectorTrait for Connector {
                 );
             }
             OrderType::Stop => {
-                let mut order = Order::default();
-                order.action = match action.as_str() {
-                    "BUY" => Action::Buy,
-                    "SELL" => Action::Sell,
-                    _ => Action::Buy,
+                let order = Order {
+                    action: match action.as_str() {
+                        "BUY" => Action::Buy,
+                        "SELL" => Action::Sell,
+                        _ => Action::Buy,
+                    },
+                    order_type: "STOP".to_string(),
+                    total_quantity: qty as f64,
+                    aux_price: Some(stop_price),
+                    ..Default::default()
                 };
-                order.order_type = "STOP".to_string();
-                order.total_quantity = qty as f64;
-                order.aux_price = Some(stop_price);
+
                 let order_id = self.ib.as_ref().unwrap().next_order_id();
                 let _trade = self
                     .ib

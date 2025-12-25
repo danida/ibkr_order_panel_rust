@@ -7,3 +7,9 @@ edition = "2024"
 ibapi = "2.2.2"
 time = "0.3.44"
 tokio = { version = "1.36.0", features = ["full"] }
+axum = "0.8.8"
+serde_json = "1.0.147"
+lazy_static = "1.4"
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+serde = { version = "1", features = ["derive"] }
